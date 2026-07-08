@@ -20,6 +20,12 @@ final class JobStore {
     /// haulier assignments instead of the often-empty job-level haulier.
     private(set) var assignmentsByJob: [Int: [MovementAssignment]] = [:]
 
+    /// Every job expanded into its movements (loads), rebuilt whenever `jobs` or
+    /// `assignmentsByJob` changes. `todaysMovements`/`movementSchedule` filter/sort
+    /// this instead of re-expanding (and re-decoding each job's furniture/transport
+    /// JSON) on every SwiftUI body evaluation.
+    private(set) var allMovements: [Movement] = []
+
     // Filters (apply to the Schedule tab)
     var typeFilter: JobType? = nil
     var statusFilter: Set<JobStatus> = []
@@ -52,6 +58,7 @@ final class JobStore {
         if session?.isDemo == true {
             jobs = Self.visible(SampleData.jobs).sorted(by: Self.chronological)
             assignmentsByJob = SampleData.assignmentsByJob
+            rebuildMovements()
             phase = .loaded
             return
         }
@@ -72,6 +79,7 @@ final class JobStore {
             let response = try await client.jobs(query: query)
             jobs = Self.visible(response.jobs).sorted(by: Self.chronological)
             assignmentsByJob = Self.indexAssignments(response.movementAssignments)
+            rebuildMovements()
             phase = .loaded
         } catch {
             phase = .failed((error as? APIError)?.errorDescription ?? error.localizedDescription)
@@ -116,6 +124,7 @@ final class JobStore {
     /// so the list cards reflect the change without a full reload.
     func setAssignments(_ assignments: [MovementAssignment], for jobId: Int) {
         assignmentsByJob[jobId] = assignments
+        rebuildMovements()
     }
 
     /// Replace a single job in place after an edit, keeping sort order.
@@ -126,6 +135,18 @@ final class JobStore {
             jobs.append(job)
         }
         jobs.sort(by: Self.chronological)
+        rebuildMovements()
+    }
+
+    /// Rebuild `allMovements` from `jobs`/`assignmentsByJob` — the one place that
+    /// pays for `Movement.expand` (and, transitively, `LineItem.parse`). Call
+    /// whenever either input changes; everything else reads the cache.
+    private func rebuildMovements() {
+        var all: [Movement] = []
+        for job in jobs {
+            all.append(contentsOf: Movement.expand(job: job, assignments: assignmentsByJob[job.id] ?? []))
+        }
+        allMovements = all
     }
 
     // MARK: Derived collections
@@ -136,31 +157,26 @@ final class JobStore {
 
     /// Today at **movement (load) granularity**: every load whose effective date is
     /// today (so a multi-load job shows each load, and a load with a date override
-    /// onto today appears here even if its job sits on another day).
+    /// onto today appears here even if its job sits on another day). Filters
+    /// `allMovements` at access time (not baked into the cache) so the "is today"
+    /// check stays correct across a midnight rollover while the app is open.
     var todaysMovements: [Movement] {
-        var all: [Movement] = []
-        for job in jobs {
-            for movement in Movement.expand(job: job, assignments: assignmentsByJob[job.id] ?? []) {
-                if DateUtil.isToday(movement.effectiveDate) { all.append(movement) }
-            }
-        }
-        return all.sorted(by: Self.movementOrder)
+        allMovements
+            .filter { DateUtil.isToday($0.effectiveDate) }
+            .sorted(by: Self.movementOrder)
     }
 
     /// The Schedule, at **movement (load) granularity**: every job's loads
-    /// expanded and grouped by each load's effective date (a per-load date
-    /// override moves that load to its own day). Honours the active filters —
-    /// type on the job, status on the movement.
+    /// grouped by each load's effective date (a per-load date override moves
+    /// that load to its own day). Honours the active filters — type on the job,
+    /// status on the movement.
     var movementSchedule: [MovementDateSection] {
-        var all: [Movement] = []
-        for job in jobs {
-            if let typeFilter, job.type != typeFilter { continue }
-            for movement in Movement.expand(job: job, assignments: assignmentsByJob[job.id] ?? []) {
-                if !statusFilter.isEmpty, !statusFilter.contains(movement.status) { continue }
-                all.append(movement)
-            }
+        let filtered = allMovements.filter { movement in
+            if let typeFilter, movement.job.type != typeFilter { return false }
+            if !statusFilter.isEmpty, !statusFilter.contains(movement.status) { return false }
+            return true
         }
-        let grouped = Dictionary(grouping: all) { $0.effectiveDate ?? "" }
+        let grouped = Dictionary(grouping: filtered) { $0.effectiveDate ?? "" }
         return grouped
             .map { MovementDateSection(dateString: $0.key, movements: $0.value.sorted(by: Self.movementOrder)) }
             .sorted { lhs, rhs in

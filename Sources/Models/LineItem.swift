@@ -30,12 +30,25 @@ struct LineItem: Codable, Identifiable, Hashable {
         }
     }
 
+    /// Content-keyed cache: `furniture`/`transport` re-parse the same JSON string
+    /// on every access (list rows, JobStore's derived collections — hundreds of
+    /// times per render pass). NSCache is thread-safe (parse can run off the main
+    /// actor during decoding) and, since the key *is* the content, never needs
+    /// invalidation.
+    private static let parseCache = NSCache<NSString, NSArray>()
+
     /// Decode a JSON-string field (furniture_items / transport_items) into items.
     /// Tolerant: returns [] for nil, empty, or malformed input.
     static func parse(_ jsonString: String?) -> [LineItem] {
         guard let jsonString,
               !jsonString.isEmpty,
               let data = jsonString.data(using: .utf8) else { return [] }
-        return (try? JSONDecoder().decode([LineItem].self, from: data)) ?? []
+        let key = jsonString as NSString
+        if let cached = parseCache.object(forKey: key) as? [LineItem] {
+            return cached
+        }
+        let items = (try? JSONDecoder().decode([LineItem].self, from: data)) ?? []
+        parseCache.setObject(items as NSArray, forKey: key)
+        return items
     }
 }

@@ -12,6 +12,15 @@ struct JobDetailView: View {
     @State private var furnitureOverrides: [MovementFurnitureRow] = []
     @State private var loadError: String?
 
+    /// Loads expanded from the job's transport, with assignments overlaid, and
+    /// what furniture sits on each (auto-allocated, overrides honoured), keyed by
+    /// `Movement.id`. Cached rather than computed, so a keystroke in the notes
+    /// field or an `isSaving` toggle doesn't re-expand/re-allocate on every body
+    /// pass — recomputed by `recomputeDerived()` whenever `job`, `assignments`,
+    /// or `furnitureOverrides` changes.
+    @State private var movements: [Movement] = []
+    @State private var allocation: [String: [LineItem]] = [:]
+
     // Job-level edit state (used for transport-less jobs)
     @State private var status: JobStatus = .pending
     @State private var notes: String = ""
@@ -25,25 +34,8 @@ struct JobDetailView: View {
     @State private var showDateEditor = false
     @State private var didAutoOpen = false
 
-    /// Loads expanded from the job's transport, with assignments overlaid.
-    private var movements: [Movement] {
-        guard let job else { return [] }
-        return Movement.expand(job: job, assignments: assignments)
-    }
-
     /// True when the job has real transport loads (so we edit per movement).
     private var hasTransportLoads: Bool { job.map { !$0.transport.isEmpty } ?? false }
-
-    /// What furniture sits on each load (auto-allocated, with overrides honoured),
-    /// keyed by `Movement.id`.
-    private var allocation: [String: [LineItem]] {
-        guard let job else { return [:] }
-        return FurnitureAllocator.allocate(
-            job: job, movements: movements,
-            capacities: session.config.furnitureCapacities,
-            overrides: furnitureOverrides
-        )
-    }
 
     var body: some View {
         Form {
@@ -90,14 +82,16 @@ struct JobDetailView: View {
             }
         }
         .sheet(item: $editingMovement) { movement in
+            // The sheet can only change status/notes/haulier/date, never furniture
+            // overrides, so skip the movement-furniture re-fetch on save.
             MovementEditSheet(movement: movement, load: allocation[movement.id] ?? []) { updated in
                 applyUpdated(updated)
-                Task { await loadMovements() }
+                Task { await loadMovements(includeFurniture: false) }
             }
         }
         .sheet(isPresented: $showDateEditor) {
             if let job {
-                DateEditSheet(job: job) { Task { await reload(force: true) } }
+                DateEditSheet(job: job) { Task { await refreshDates() } }
             }
         }
         .task { await reload() }
@@ -391,6 +385,24 @@ struct JobDetailView: View {
         status = job.status
         notes = job.notes ?? ""
         haulierId = job.haulierId
+        recomputeDerived()
+    }
+
+    /// Rebuilds `movements`/`allocation` from the current `job`/`assignments`/
+    /// `furnitureOverrides`. Call after any of those three change.
+    private func recomputeDerived() {
+        guard let job else {
+            movements = []
+            allocation = [:]
+            return
+        }
+        let expanded = Movement.expand(job: job, assignments: assignments)
+        movements = expanded
+        allocation = FurnitureAllocator.allocate(
+            job: job, movements: expanded,
+            capacities: session.config.furnitureCapacities,
+            overrides: furnitureOverrides
+        )
     }
 
     private func reload(force: Bool = false) async {
@@ -400,10 +412,14 @@ struct JobDetailView: View {
         }
         // Seed loads from the list's cached assignments (covers archived/closed jobs,
         // whose live movement endpoints 404 — the list already merged their history).
-        if assignments.isEmpty { assignments = store.assignments(for: jobId) }
+        if assignments.isEmpty {
+            assignments = store.assignments(for: jobId)
+            recomputeDerived()
+        }
         if session.isDemo {
             assignments = store.assignments(for: jobId)
             furnitureOverrides = []
+            recomputeDerived()
             autoOpenSheetIfRequested()
             return
         }
@@ -418,7 +434,7 @@ struct JobDetailView: View {
 
         do {
             let fresh = try await jobResult
-            if force || !isDirty || job == nil { apply(fresh) } else { self.job = fresh }
+            if force || !isDirty || job == nil { apply(fresh) } else { self.job = fresh; recomputeDerived() }
             loadError = nil
         } catch {
             if job == nil { loadError = (error as? APIError)?.errorDescription ?? error.localizedDescription }
@@ -427,11 +443,36 @@ struct JobDetailView: View {
         if let fresh = try? await movementsResult {
             assignments = fresh
             store.setAssignments(fresh, for: jobId)
+            recomputeDerived()
         }
         if let furn = try? await furnitureResult {
             furnitureOverrides = furn
+            recomputeDerived()
         }
         autoOpenSheetIfRequested()
+    }
+
+    /// After a date save, only this job's dates and its related job's dates
+    /// changed (assignments/furniture overrides are untouched — see
+    /// `APIClient.updateDates`), so refresh just those two GETs instead of the
+    /// full 4-GET `reload(force:)`.
+    private func refreshDates() async {
+        if session.isDemo {
+            // Demo's DateEditSheet doesn't mutate sample data; mirror reload()'s
+            // existing demo no-op path exactly.
+            await reload(force: true)
+            return
+        }
+        guard let client = session.client else { return }
+        async let jobResult = client.job(id: jobId)
+        async let relatedResult = client.relatedJob(id: jobId)
+        if let fresh = try? await jobResult {
+            apply(fresh)
+            store.replace(fresh)
+        }
+        // Matches reload()'s existing behaviour: `related` is local display state
+        // only — reload() doesn't push related jobs into the store either.
+        related = (try? await relatedResult) ?? []
     }
 
     /// `-openSheet movement|dates` launch arg auto-presents a sheet (screenshots).
@@ -445,17 +486,34 @@ struct JobDetailView: View {
         }
     }
 
-    private func loadMovements() async {
-        guard hasTransportLoads else { assignments = []; furnitureOverrides = []; return }
-        if session.isDemo { assignments = store.assignments(for: jobId); furnitureOverrides = []; return }
+    /// Refreshes assignments (and, by default, movement-furniture overrides).
+    /// Pass `includeFurniture: false` when the caller knows furniture can't have
+    /// changed (e.g. a movement save, which only ever touches status/notes/
+    /// haulier/date) to skip that GET.
+    private func loadMovements(includeFurniture: Bool = true) async {
+        guard hasTransportLoads else {
+            assignments = []
+            furnitureOverrides = []
+            recomputeDerived()
+            return
+        }
+        if session.isDemo {
+            assignments = store.assignments(for: jobId)
+            furnitureOverrides = []
+            recomputeDerived()
+            return
+        }
         guard let client = session.client else { return }
         if let fresh = try? await client.movements(jobId: jobId) {
             assignments = fresh
             // Keep the list cards' haulier roll-up in sync with this job's loads.
             store.setAssignments(fresh, for: jobId)
+            recomputeDerived()
         }
+        guard includeFurniture else { return }
         if let furn = try? await client.movementFurniture(jobId: jobId) {
             furnitureOverrides = furn
+            recomputeDerived()
         }
     }
 
