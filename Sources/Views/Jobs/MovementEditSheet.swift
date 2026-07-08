@@ -1,8 +1,19 @@
 import SwiftUI
 
+/// The edited fields from a `MovementEditSheet` save, handed to the parent
+/// (`JobDetailView`) to apply optimistically and PATCH in the background. The
+/// sheet itself never touches the network — see `JobDetailView.saveMovement`.
+struct MovementEdit {
+    let status: JobStatus
+    let notes: String
+    let haulier: APIClient.HaulierChange
+    let date: APIClient.DateChange
+}
+
 /// Edit a single load: status + notes (all roles), haulier + per-movement date
-/// (admins). Saves via PATCH /jobs/:id with a movement payload and hands the
-/// updated job back to the caller.
+/// (admins). A pure editor — it hands the edited values back to the caller via
+/// `onSaved` and dismisses immediately; the caller owns the PATCH so a dismissed
+/// sheet can't strand an in-flight save.
 struct MovementEditSheet: View {
     @Environment(Session.self) private var session
     @Environment(\.dismiss) private var dismiss
@@ -10,15 +21,13 @@ struct MovementEditSheet: View {
 
     let movement: Movement
     let load: [LineItem]
-    let onSaved: (Job) -> Void
+    let onSaved: (MovementEdit) -> Void
 
     @State private var status: JobStatus = .pending
     @State private var notes: String = ""
     @State private var haulierId: Int?
     @State private var overrideDate = false
     @State private var date = Date()
-    @State private var isSaving = false
-    @State private var errorMessage: String?
 
     private var isAdmin: Bool { session.isAdmin }
 
@@ -93,11 +102,6 @@ struct MovementEditSheet: View {
                         .lineLimit(2...6)
                 }
                 .listRowBackground(Theme.card)
-
-                if let errorMessage {
-                    Section { Text(errorMessage).foregroundStyle(.red).font(.footnote) }
-                        .listRowBackground(Theme.card)
-                }
             }
             .scrollContentBackground(.hidden)
             .background(Theme.canvas)
@@ -108,8 +112,7 @@ struct MovementEditSheet: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    if isSaving { ProgressView() }
-                    else { Button("Save") { Task { await save() } }.fontWeight(.semibold) }
+                    Button("Save") { save() }.fontWeight(.semibold)
                 }
             }
             .onAppear(perform: seed)
@@ -176,10 +179,12 @@ struct MovementEditSheet: View {
         }
     }
 
-    private func save() async {
-        guard let transportName = movement.transportName else { dismiss(); return }
-        isSaving = true
-        errorMessage = nil
+    /// Hands the edited fields to the parent, fires the success haptic, and
+    /// dismisses immediately — the parent applies them optimistically and owns
+    /// the PATCH (see `JobDetailView.saveMovement`), so this never awaits the
+    /// network.
+    private func save() {
+        guard movement.transportName != nil else { dismiss(); return }
 
         let newDateString = overrideDate ? DateUtil.apiString(from: date) : nil
         let haulierChange: APIClient.HaulierChange =
@@ -187,35 +192,8 @@ struct MovementEditSheet: View {
         let dateChange: APIClient.DateChange =
             (isAdmin && newDateString != movement.dateOverride) ? .set(newDateString) : .unchanged
 
-        // Demo: apply locally (single-movement sample jobs map to job-level edit).
-        if session.isDemo {
-            let updated = movement.job.withLocalEdits(
-                status: status, notes: notes,
-                haulierId: haulierId, haulierName: session.haulier(id: haulierId)?.name
-            )
-            onSaved(updated)
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            dismiss()
-            return
-        }
-
-        guard let client = session.client else { isSaving = false; return }
-        do {
-            let updated = try await client.updateMovement(
-                jobId: movement.job.id,
-                transportName: transportName,
-                movementIndex: movement.movementIndex,
-                status: status, notes: notes,
-                haulier: haulierChange, date: dateChange,
-                isAdmin: isAdmin
-            )
-            onSaved(updated)
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            dismiss()
-        } catch {
-            errorMessage = (error as? APIError)?.errorDescription ?? error.localizedDescription
-            UINotificationFeedbackGenerator().notificationOccurred(.error)
-            isSaving = false
-        }
+        onSaved(MovementEdit(status: status, notes: notes, haulier: haulierChange, date: dateChange))
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        dismiss()
     }
 }

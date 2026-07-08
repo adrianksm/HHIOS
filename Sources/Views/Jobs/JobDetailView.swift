@@ -25,9 +25,16 @@ struct JobDetailView: View {
     @State private var status: JobStatus = .pending
     @State private var notes: String = ""
     @State private var haulierId: Int?
+    /// Guards only the brief synchronous window between a tap and the optimistic
+    /// apply landing — the background PATCH itself never blocks this (a second
+    /// edit while a save is in flight is allowed; last-write-wins).
     @State private var isSaving = false
-    @State private var saveError: String?
     @State private var savedTick = false
+
+    /// Surfaces every background-save failure (movement, job-level, dates) via
+    /// one alert, since all three saves' network calls now run detached from
+    /// any sheet/form that could otherwise show an inline error.
+    @State private var backgroundSaveError: String?
 
     // Sheets
     @State private var editingMovement: Movement?
@@ -71,11 +78,10 @@ struct JobDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                if isSaving {
-                    ProgressView()
-                } else if !hasTransportLoads, isDirty, !(job?.isClosed ?? false) {
+                if !hasTransportLoads, isDirty, !(job?.isClosed ?? false) {
                     Button("Save") { Task { await save() } }
                         .fontWeight(.semibold)
+                        .disabled(isSaving)
                 } else if savedTick {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.statusColor(.completed))
                 }
@@ -84,15 +90,24 @@ struct JobDetailView: View {
         .sheet(item: $editingMovement) { movement in
             // The sheet can only change status/notes/haulier/date, never furniture
             // overrides, so skip the movement-furniture re-fetch on save.
-            MovementEditSheet(movement: movement, load: allocation[movement.id] ?? []) { updated in
-                applyUpdated(updated)
-                Task { await loadMovements(includeFurniture: false) }
+            MovementEditSheet(movement: movement, load: allocation[movement.id] ?? []) { edit in
+                saveMovement(movement, edit)
             }
         }
         .sheet(isPresented: $showDateEditor) {
             if let job {
-                DateEditSheet(job: job) { Task { await refreshDates() } }
+                DateEditSheet(job: job) { deliverDate, collectDate in
+                    saveDates(deliverDate: deliverDate, collectDate: collectDate)
+                }
             }
+        }
+        .alert("Couldn't save", isPresented: Binding(
+            get: { backgroundSaveError != nil },
+            set: { if !$0 { backgroundSaveError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(backgroundSaveError ?? "")
         }
         .task { await reload() }
     }
@@ -270,10 +285,6 @@ struct JobDetailView: View {
                 Text("Notes").font(.dc(12)).foregroundStyle(Theme.tertiary)
                 TextField("Add a note…", text: $notes, axis: .vertical)
                     .lineLimit(2...6)
-            }
-
-            if let saveError {
-                Text(saveError).font(.footnote).foregroundStyle(.red)
             }
         }
         .listRowBackground(Theme.card)
@@ -522,6 +533,21 @@ struct JobDetailView: View {
         store.replace(updated)
     }
 
+    /// Resolves an `APIClient.HaulierChange` to the concrete value to store
+    /// locally: the new id when `.set`, otherwise whatever was already there.
+    private func resolvedHaulierId(_ change: APIClient.HaulierChange, current: Int?) -> Int? {
+        if case .set(let value) = change { return value }
+        return current
+    }
+
+    /// Resolves an `APIClient.DateChange` to the concrete date string to store
+    /// locally: the new value when `.set` (including clearing to nil), otherwise
+    /// whatever was already there.
+    private func resolvedDate(_ change: APIClient.DateChange, current: String?) -> String? {
+        if case .set(let value) = change { return value }
+        return current
+    }
+
     /// Quick-send this load's details to its assigned driver on WhatsApp.
     private func sendLoadWhatsApp(movement: Movement, phoneDigits: String) {
         guard let job else { return }
@@ -544,8 +570,13 @@ struct JobDetailView: View {
         }
     }
 
+    /// Job-level save for transport-less jobs. Optimistic: applies the edit and
+    /// dismisses the toolbar's Save button instantly via `Job.withLocalEdits`;
+    /// the PATCH runs in a detached background `Task` and rolls back to the
+    /// snapshotted job on failure.
     private func save() async {
-        guard isDirty, let current = job else { return }
+        guard isDirty, !isSaving, let current = job else { return }
+        isSaving = true
 
         // Demo mode: apply the edit locally, no network.
         if session.isDemo {
@@ -556,33 +587,156 @@ struct JobDetailView: View {
             apply(updated)
             store.replace(updated)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
+            isSaving = false
             withAnimation { savedTick = true }
             try? await Task.sleep(for: .seconds(2))
             withAnimation { savedTick = false }
             return
         }
 
-        guard let client = session.client else { return }
-        isSaving = true
-        saveError = nil
-        do {
-            let updated = try await client.updateJob(
-                id: jobId,
-                status: status,
-                notes: notes,
-                haulier: session.isAdmin ? .set(haulierId) : .unchanged
-            )
-            apply(updated)
-            store.replace(updated)
-            await UINotificationFeedbackGenerator().notificationOccurred(.success)
-            withAnimation { savedTick = true }
-            try? await Task.sleep(for: .seconds(2))
-            withAnimation { savedTick = false }
-        } catch {
-            saveError = (error as? APIError)?.errorDescription ?? error.localizedDescription
-            await UINotificationFeedbackGenerator().notificationOccurred(.error)
-        }
+        guard let client = session.client else { isSaving = false; return }
+
+        // Snapshot for rollback, then apply optimistically.
+        let previousJob = current
+        let newStatus = status
+        let newNotes = notes
+        let newHaulierId = haulierId
+        let haulierChange: APIClient.HaulierChange = session.isAdmin ? .set(newHaulierId) : .unchanged
+
+        let optimistic = current.withLocalEdits(
+            status: newStatus, notes: newNotes,
+            haulierId: newHaulierId, haulierName: session.haulier(id: newHaulierId)?.name
+        )
+        apply(optimistic)
+        store.replace(optimistic)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
         isSaving = false
+
+        Task {
+            do {
+                let updated = try await client.updateJob(
+                    id: jobId, status: newStatus, notes: newNotes, haulier: haulierChange
+                )
+                applyUpdated(updated)
+            } catch {
+                apply(previousJob)
+                store.replace(previousJob)
+                backgroundSaveError = ((error as? APIError)?.errorDescription ?? error.localizedDescription)
+                    + " Your change was undone."
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+        }
+
+        withAnimation { savedTick = true }
+        try? await Task.sleep(for: .seconds(2))
+        withAnimation { savedTick = false }
+    }
+
+    /// Applies a `MovementEditSheet` save. Optimistic outside demo mode: upserts
+    /// the local `MovementAssignment` row for (transportName, movementIndex) so
+    /// the load's status/notes/haulier/date reflect instantly, then PATCHes in a
+    /// detached background `Task`. On success, converges to server truth via
+    /// `loadMovements`; on failure, rolls back to the snapshot taken here.
+    private func saveMovement(_ movement: Movement, _ edit: MovementEdit) {
+        guard let transportName = movement.transportName else { return }
+
+        // Demo: apply as a job-level edit, exactly mirroring the sheet's former
+        // demo branch (demo sample jobs are treated as single-movement, so a
+        // movement edit maps onto the job itself) — no assignment upsert, no
+        // network.
+        if session.isDemo {
+            let demoHaulierId = resolvedHaulierId(edit.haulier, current: movement.haulierId)
+            let updated = movement.job.withLocalEdits(
+                status: edit.status, notes: edit.notes,
+                haulierId: demoHaulierId, haulierName: session.haulier(id: demoHaulierId)?.name
+            )
+            applyUpdated(updated)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            return
+        }
+
+        guard let client = session.client, let job else { return }
+
+        // Snapshot for rollback.
+        let previousJob = job
+        let previousAssignments = assignments
+        let previousStoreAssignments = store.assignments(for: jobId)
+
+        // Optimistic upsert: update the matching row, or synthesize a placeholder
+        // (server-owned fields get sensible nil/derived values — the follow-up
+        // GET on success replaces this row with server truth either way).
+        let existing = assignments.first {
+            $0.transportName == transportName && $0.movementIndex == movement.movementIndex
+        }
+        let haulierId = resolvedHaulierId(edit.haulier, current: existing?.haulierId)
+        let dateValue = resolvedDate(edit.date, current: existing?.date)
+        let haulierName = haulierId == nil ? nil : (session.haulier(id: haulierId)?.name ?? existing?.haulierName)
+        let haulierColor = haulierId == nil ? nil : (session.haulier(id: haulierId)?.color ?? existing?.haulierColor)
+        let optimisticRow = MovementAssignment(
+            id: existing?.id ?? 0,
+            jobId: jobId,
+            transportName: transportName,
+            movementIndex: movement.movementIndex,
+            haulierId: haulierId,
+            notes: edit.notes,
+            statusRaw: edit.status.rawValue,
+            date: dateValue,
+            haulierName: haulierName,
+            haulierColor: haulierColor
+        )
+        if let idx = assignments.firstIndex(where: {
+            $0.transportName == transportName && $0.movementIndex == movement.movementIndex
+        }) {
+            assignments[idx] = optimisticRow
+        } else {
+            assignments.append(optimisticRow)
+        }
+        store.setAssignments(assignments, for: jobId)
+        recomputeDerived()
+
+        Task {
+            do {
+                let updatedJob = try await client.updateMovement(
+                    jobId: jobId, transportName: transportName, movementIndex: movement.movementIndex,
+                    status: edit.status, notes: edit.notes,
+                    haulier: edit.haulier, date: edit.date,
+                    isAdmin: session.isAdmin
+                )
+                applyUpdated(updatedJob)
+                await loadMovements(includeFurniture: false)
+            } catch {
+                assignments = previousAssignments
+                store.setAssignments(previousStoreAssignments, for: jobId)
+                apply(previousJob)
+                store.replace(previousJob)
+                recomputeDerived()
+                backgroundSaveError = ((error as? APIError)?.errorDescription ?? error.localizedDescription)
+                    + " Your change was undone."
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+        }
+    }
+
+    /// Applies a `DateEditSheet` save. Not optimistic — `Job` has no local-edit
+    /// helper for dates (they're admin-rare) — so the UI keeps showing the old
+    /// dates until the PATCH lands and `refreshDates()` pulls server truth.
+    private func saveDates(deliverDate: String, collectDate: String) {
+        if session.isDemo {
+            // Demo's DateEditSheet doesn't mutate sample data; mirror
+            // refreshDates()'s existing demo no-op path.
+            Task { await refreshDates() }
+            return
+        }
+        guard let client = session.client else { return }
+        Task {
+            do {
+                try await client.updateDates(jobId: jobId, deliverDate: deliverDate, collectDate: collectDate)
+                await refreshDates()
+            } catch {
+                backgroundSaveError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+        }
     }
 }
 

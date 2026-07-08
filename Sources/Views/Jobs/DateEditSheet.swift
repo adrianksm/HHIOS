@@ -1,18 +1,18 @@
 import SwiftUI
 
-/// Edit the opportunity's delivery & collection dates (admin). Saving pushes the
-/// change to Current-RMS server-side and updates both linked jobs.
+/// Edit the opportunity's delivery & collection dates (admin). A pure editor —
+/// it hands the edited dates back to the caller via `onSaved` and dismisses
+/// immediately; the caller owns the PATCH (see `JobDetailView.saveDates`), since
+/// dates aren't optimistic (Job has no local-edit helper for them).
 struct DateEditSheet: View {
     @Environment(Session.self) private var session
     @Environment(\.dismiss) private var dismiss
 
     let job: Job
-    let onSaved: () -> Void
+    let onSaved: (_ deliverDate: String, _ collectDate: String) -> Void
 
     @State private var deliver = Date()
     @State private var collect = Date()
-    @State private var isSaving = false
-    @State private var errorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -24,11 +24,6 @@ struct DateEditSheet: View {
                     Text("Changing dates updates Current-RMS and both the delivery and collection jobs.")
                 }
                 .listRowBackground(Theme.card)
-
-                if let errorMessage {
-                    Section { Text(errorMessage).foregroundStyle(.red).font(.footnote) }
-                        .listRowBackground(Theme.card)
-                }
             }
             .scrollContentBackground(.hidden)
             .background(Theme.canvas)
@@ -37,8 +32,7 @@ struct DateEditSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    if isSaving { ProgressView() }
-                    else { Button("Save") { Task { await save() } }.fontWeight(.semibold) }
+                    Button("Save") { save() }.fontWeight(.semibold)
                 }
             }
             .onAppear(perform: seed)
@@ -51,31 +45,9 @@ struct DateEditSheet: View {
         if collect < deliver { collect = deliver }
     }
 
-    private func save() async {
-        isSaving = true
-        errorMessage = nil
-
-        if session.isDemo {
-            onSaved()
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            dismiss()
-            return
-        }
-
-        guard let client = session.client else { isSaving = false; return }
-        do {
-            try await client.updateDates(
-                jobId: job.id,
-                deliverDate: DateUtil.apiString(from: deliver),
-                collectDate: DateUtil.apiString(from: collect)
-            )
-            onSaved()
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            dismiss()
-        } catch {
-            errorMessage = (error as? APIError)?.errorDescription ?? error.localizedDescription
-            UINotificationFeedbackGenerator().notificationOccurred(.error)
-            isSaving = false
-        }
+    private func save() {
+        onSaved(DateUtil.apiString(from: deliver), DateUtil.apiString(from: collect))
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        dismiss()
     }
 }
