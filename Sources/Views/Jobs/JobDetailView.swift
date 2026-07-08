@@ -417,6 +417,22 @@ struct JobDetailView: View {
     }
 
     private func reload(force: Bool = false) async {
+        // Freshness-window fast path: a recent cached detail (job + related +
+        // assignments + furniture overrides) means zero network — reopening a
+        // job just viewed is instant. Bypassed by `force` and by demo mode
+        // (demo never reads/writes this cache).
+        if !force, !session.isDemo,
+           let cached = store.detail(for: jobId),
+           Date().timeIntervalSince(cached.fetchedAt) < JobStore.detailCacheWindow {
+            related = cached.related
+            assignments = cached.assignments
+            furnitureOverrides = cached.furnitureOverrides
+            apply(cached.job)
+            loadError = nil
+            autoOpenSheetIfRequested()
+            return
+        }
+
         // Instant render from cache, then refresh from the server.
         if job == nil, let cached = store.jobs.first(where: { $0.id == jobId }) {
             apply(cached)
@@ -443,10 +459,12 @@ struct JobDetailView: View {
         async let movementsResult = client.movements(jobId: jobId)
         async let furnitureResult = client.movementFurniture(jobId: jobId)
 
+        var jobFetchSucceeded = false
         do {
             let fresh = try await jobResult
             if force || !isDirty || job == nil { apply(fresh) } else { self.job = fresh; recomputeDerived() }
             loadError = nil
+            jobFetchSucceeded = true
         } catch {
             if job == nil { loadError = (error as? APIError)?.errorDescription ?? error.localizedDescription }
         }
@@ -459,6 +477,15 @@ struct JobDetailView: View {
         if let furn = try? await furnitureResult {
             furnitureOverrides = furn
             recomputeDerived()
+        }
+        // Only cache when the job itself genuinely refreshed — never write a
+        // stale seeded/list-cache job back out with a fresh timestamp.
+        if jobFetchSucceeded, let job {
+            store.setDetail(
+                JobStore.JobDetail(job: job, related: related, assignments: assignments,
+                                    furnitureOverrides: furnitureOverrides, fetchedAt: Date()),
+                for: jobId
+            )
         }
         autoOpenSheetIfRequested()
     }
@@ -577,6 +604,8 @@ struct JobDetailView: View {
     private func save() async {
         guard isDirty, !isSaving, let current = job else { return }
         isSaving = true
+        // A post-save reopen should see the change, not a stale cached detail.
+        store.invalidateDetail(for: jobId)
 
         // Demo mode: apply the edit locally, no network.
         if session.isDemo {
@@ -639,6 +668,8 @@ struct JobDetailView: View {
     /// `loadMovements`; on failure, rolls back to the snapshot taken here.
     private func saveMovement(_ movement: Movement, _ edit: MovementEdit) {
         guard let transportName = movement.transportName else { return }
+        // A post-save reopen should see the change, not a stale cached detail.
+        store.invalidateDetail(for: jobId)
 
         // Demo: apply as a job-level edit, exactly mirroring the sheet's former
         // demo branch (demo sample jobs are treated as single-movement, so a
@@ -721,6 +752,8 @@ struct JobDetailView: View {
     /// helper for dates (they're admin-rare) — so the UI keeps showing the old
     /// dates until the PATCH lands and `refreshDates()` pulls server truth.
     private func saveDates(deliverDate: String, collectDate: String) {
+        // A post-save reopen should see the change, not a stale cached detail.
+        store.invalidateDetail(for: jobId)
         if session.isDemo {
             // Demo's DateEditSheet doesn't mutate sample data; mirror
             // refreshDates()'s existing demo no-op path.

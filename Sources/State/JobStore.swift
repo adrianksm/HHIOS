@@ -26,6 +26,38 @@ final class JobStore {
     /// JSON) on every SwiftUI body evaluation.
     private(set) var allMovements: [Movement] = []
 
+    /// Everything `JobDetailView` needs for one job, cached in memory for
+    /// `detailCacheWindow` after a successful fetch so reopening a just-viewed
+    /// job is instant and fires no network. Never persisted — its lifetime is
+    /// the store's own (the store is scoped to the signed-in session, see
+    /// `MainTabView`, and is recreated fresh on the next sign-in), so one
+    /// user's details never leak into the next.
+    struct JobDetail {
+        let job: Job
+        let related: [Job]
+        let assignments: [MovementAssignment]
+        let furnitureOverrides: [MovementFurnitureRow]
+        let fetchedAt: Date
+    }
+
+    /// How long a cached `JobDetail` stays fresh before `JobDetailView` should
+    /// re-fetch instead of trusting the cache.
+    static let detailCacheWindow: TimeInterval = 180
+
+    private var detailCache: [Int: JobDetail] = [:]
+
+    func detail(for jobId: Int) -> JobDetail? {
+        detailCache[jobId]
+    }
+
+    func setDetail(_ detail: JobDetail, for jobId: Int) {
+        detailCache[jobId] = detail
+    }
+
+    func invalidateDetail(for jobId: Int) {
+        detailCache.removeValue(forKey: jobId)
+    }
+
     // Filters (apply to the Schedule tab)
     var typeFilter: JobType? = nil
     var statusFilter: Set<JobStatus> = []
@@ -51,7 +83,16 @@ final class JobStore {
     var isLoading: Bool { phase == .loading }
 
     func loadIfNeeded() async {
-        if case .idle = phase { await load() }
+        guard case .idle = phase else { return }
+        // Instant path: a matching on-disk snapshot lets us render before any
+        // network call, then a background `load()` refreshes quietly (see
+        // `restoreSnapshotIfMatching` and Part B's phase rules below).
+        if let session, !session.isDemo, restoreSnapshotIfMatching(session: session) {
+            phase = .loaded
+            Task { await load() }
+            return
+        }
+        await load()
     }
 
     func load() async {
@@ -63,10 +104,13 @@ final class JobStore {
             return
         }
         guard let client = session?.client else {
-            phase = .failed("No server configured.")
+            if jobs.isEmpty { phase = .failed("No server configured.") }
             return
         }
-        phase = .loading
+        // With a snapshot (or prior load) already on screen, this is a silent
+        // background refresh — don't blank the UI. Pull-to-refresh has its own
+        // native spinner, and "Load earlier" reads `isLoading` to disable itself.
+        if jobs.isEmpty { phase = .loading }
         // Window: `historyDaysBack` of history plus everything upcoming. Client-side
         // grouping handles Today vs Schedule, so one fetch feeds both tabs.
         // include_movements brings per-load assignments so cards show the real haulier(s).
@@ -81,8 +125,13 @@ final class JobStore {
             assignmentsByJob = Self.indexAssignments(response.movementAssignments)
             rebuildMovements()
             phase = .loaded
+            saveSnapshot()
         } catch {
-            phase = .failed((error as? APIError)?.errorDescription ?? error.localizedDescription)
+            // A failed background refresh with data already on screen keeps that
+            // data up and stays silent; only a first-ever load surfaces the error.
+            if jobs.isEmpty {
+                phase = .failed((error as? APIError)?.errorDescription ?? error.localizedDescription)
+            }
         }
     }
 
@@ -94,6 +143,94 @@ final class JobStore {
         historyDaysBack += 14
         await load()
         isLoadingMore = false
+    }
+
+    // MARK: - Disk snapshot (instant launch)
+
+    /// On-disk copy of the last successful non-demo `load()`, written to a
+    /// single JSON file in Application Support so the next launch can render
+    /// instantly and refresh in the background. `Job`/`MovementAssignment` are
+    /// already `Codable` (verified: every stored property is listed in their
+    /// `CodingKeys` and none has a custom `init(from:)`/`encode(to:)`, so both
+    /// directions synthesize) — no changes were needed to make them round-trip.
+    private struct Snapshot: Codable {
+        var schemaVersion: Int
+        var serverURL: String
+        var username: String
+        var savedAt: Date
+        var historyDaysBack: Int
+        var jobs: [Job]
+        var assignmentsByJob: [Int: [MovementAssignment]]
+    }
+
+    private static let snapshotSchemaVersion = 1
+
+    // `nonisolated` — these touch only `FileManager`, no actor-isolated state,
+    // and must be reachable from the detached background task in `saveSnapshot()`.
+    private nonisolated static var snapshotDirectory: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("HHiOS", isDirectory: true)
+    }
+
+    private nonisolated static var snapshotURL: URL? {
+        snapshotDirectory?.appendingPathComponent("job-snapshot.json")
+    }
+
+    /// Populates `jobs`/`assignmentsByJob`/`historyDaysBack` from the on-disk
+    /// snapshot if one exists and matches the current server + signed-in user
+    /// and schema version. Returns whether it did. Tolerant of every failure
+    /// mode (missing file, schema drift, decode error, wrong identity) — a
+    /// stale or unreadable snapshot is simply ignored and overwritten by the
+    /// next successful `load()`.
+    private func restoreSnapshotIfMatching(session: Session) -> Bool {
+        guard let username = session.user?.username,
+              let url = Self.snapshotURL,
+              let data = try? Data(contentsOf: url),
+              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),
+              snapshot.schemaVersion == Self.snapshotSchemaVersion,
+              snapshot.serverURL == session.baseURLString,
+              snapshot.username == username
+        else { return false }
+        jobs = snapshot.jobs
+        assignmentsByJob = snapshot.assignmentsByJob
+        historyDaysBack = snapshot.historyDaysBack
+        rebuildMovements()
+        return true
+    }
+
+    /// Persists the just-loaded jobs/assignments so the next launch can
+    /// restore them via `restoreSnapshotIfMatching`. `Snapshot` is a plain
+    /// value-type copy of the data at this moment, so it's safe to hand to a
+    /// detached background task for the encode + write — the store itself
+    /// (`@MainActor`) is never blocked. Tolerant of every failure (no
+    /// Application Support directory, encode error, disk full): a cache write
+    /// must never crash or block the app.
+    private func saveSnapshot() {
+        guard let session, !session.isDemo, let username = session.user?.username else { return }
+        let snapshot = Snapshot(
+            schemaVersion: Self.snapshotSchemaVersion,
+            serverURL: session.baseURLString,
+            username: username,
+            savedAt: Date(),
+            historyDaysBack: historyDaysBack,
+            jobs: jobs,
+            assignmentsByJob: assignmentsByJob
+        )
+        Task.detached(priority: .utility) {
+            guard let dir = Self.snapshotDirectory, let url = Self.snapshotURL else { return }
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Deletes the on-disk snapshot. Called on sign-out (which also covers a
+    /// server-URL change — `ServerSettingsView` always signs out when the
+    /// address changes) so one user's cached jobs never sit around to leak
+    /// into the next session. Safe to call even when no snapshot exists.
+    static func deleteSnapshot() {
+        guard let url = snapshotURL else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     /// Drop archived jobs that aren't genuinely completed. The local archive
