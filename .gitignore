@@ -1,0 +1,17 @@
+# XcodeGen generates this from project.yml — regenerate with `xcodegen generate`
+HHiOS.xcodeproj/
+
+# Xcode / build
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.swiftpm/
+.build/

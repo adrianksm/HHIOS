@@ -1,0 +1,611 @@
+import SwiftUI
+
+struct JobDetailView: View {
+    @Environment(Session.self) private var session
+    @Environment(JobStore.self) private var store
+    @Environment(\.openURL) private var openURL
+    let jobId: Int
+
+    @State private var job: Job?
+    @State private var related: [Job] = []
+    @State private var assignments: [MovementAssignment] = []
+    @State private var furnitureOverrides: [MovementFurnitureRow] = []
+    @State private var loadError: String?
+
+    // Job-level edit state (used for transport-less jobs)
+    @State private var status: JobStatus = .pending
+    @State private var notes: String = ""
+    @State private var haulierId: Int?
+    @State private var isSaving = false
+    @State private var saveError: String?
+    @State private var savedTick = false
+
+    // Sheets
+    @State private var editingMovement: Movement?
+    @State private var showDateEditor = false
+    @State private var didAutoOpen = false
+
+    /// Loads expanded from the job's transport, with assignments overlaid.
+    private var movements: [Movement] {
+        guard let job else { return [] }
+        return Movement.expand(job: job, assignments: assignments)
+    }
+
+    /// True when the job has real transport loads (so we edit per movement).
+    private var hasTransportLoads: Bool { job.map { !$0.transport.isEmpty } ?? false }
+
+    /// What furniture sits on each load (auto-allocated, with overrides honoured),
+    /// keyed by `Movement.id`.
+    private var allocation: [String: [LineItem]] {
+        guard let job else { return [:] }
+        return FurnitureAllocator.allocate(
+            job: job, movements: movements,
+            capacities: session.config.furnitureCapacities,
+            overrides: furnitureOverrides
+        )
+    }
+
+    var body: some View {
+        Form {
+            if let job {
+                summarySection(job)
+                if job.isClosed { archivedNote }
+                infoGroup(job)
+                mapSection(job)
+                if hasTransportLoads {
+                    loadsSection
+                } else if job.isClosed {
+                    closedStatusSection(job)
+                } else {
+                    editSection(job)
+                }
+                detailsSection(job)
+                contactSection(job)
+                relatedSection
+            } else if let loadError {
+                Section {
+                    ErrorState(message: loadError) { Task { await reload() } }
+                        .frame(maxWidth: .infinity)
+                }
+                .listRowBackground(Theme.card)
+            } else {
+                Section { LoadingState().frame(height: 160) }
+                    .listRowBackground(Theme.card)
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(Theme.canvas)
+        .navigationTitle(job?.type.label ?? "Job")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                if isSaving {
+                    ProgressView()
+                } else if !hasTransportLoads, isDirty, !(job?.isClosed ?? false) {
+                    Button("Save") { Task { await save() } }
+                        .fontWeight(.semibold)
+                } else if savedTick {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.statusColor(.completed))
+                }
+            }
+        }
+        .sheet(item: $editingMovement) { movement in
+            MovementEditSheet(movement: movement, load: allocation[movement.id] ?? []) { updated in
+                applyUpdated(updated)
+                Task { await loadMovements() }
+            }
+        }
+        .sheet(isPresented: $showDateEditor) {
+            if let job {
+                DateEditSheet(job: job) { Task { await reload(force: true) } }
+            }
+        }
+        .task { await reload() }
+    }
+
+    // MARK: Loads (per-movement)
+
+    private var loadsSection: some View {
+        let closed = job?.isClosed ?? false
+        return Section {
+            ForEach(movements) { movement in
+                if closed {
+                    MovementRow(movement: movement,
+                                haulier: session.haulier(id: movement.haulierId),
+                                load: allocation[movement.id] ?? [],
+                                isInteractive: false)
+                } else {
+                    Button { editingMovement = movement } label: {
+                        MovementRow(movement: movement,
+                                    haulier: session.haulier(id: movement.haulierId),
+                                    load: allocation[movement.id] ?? [])
+                    }
+                    .buttonStyle(.plain)
+                    .swipeActions(edge: .trailing) {
+                        if let haulier = session.haulier(id: movement.haulierId),
+                           let digits = WhatsApp.formatUKPhone(haulier.phone) {
+                            Button {
+                                sendLoadWhatsApp(movement: movement, phoneDigits: digits)
+                            } label: {
+                                Label("WhatsApp", systemImage: "message.fill")
+                            }
+                            .tint(Theme.whatsApp)
+                        }
+                    }
+                }
+            }
+            .listRowBackground(Theme.card)
+        } header: {
+            Text(movements.count > 1 ? "Loads · \(movements.count)" : "Load")
+        } footer: {
+            Text(closed
+                 ? "Completed in Current-RMS — read-only."
+                 : (session.isAdmin
+                    ? "Tap a load to set status, haulier, date and notes."
+                    : "Tap a load to update status and notes."))
+        }
+    }
+
+    /// Read-only banner for archived (completed-in-CRMS) jobs.
+    private var archivedNote: some View {
+        Section {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.seal.fill").foregroundStyle(Theme.tertiary)
+                Text("Completed in Current-RMS · read-only history")
+                    .font(.dc(13))
+                    .foregroundStyle(Theme.secondary)
+            }
+        }
+        .listRowBackground(Theme.card)
+    }
+
+    /// Read-only status / haulier / notes for a closed transport-less job.
+    @ViewBuilder
+    private func closedStatusSection(_ job: Job) -> some View {
+        Section("Status") {
+            LabeledContent("Status") { StatusDot(status: job.status) }
+            if job.hasHaulier {
+                LabeledContent("Haulier") {
+                    HaulierTag(name: job.haulierName, colorHex: session.haulier(id: job.haulierId)?.color)
+                }
+            }
+            if let notes = job.notes?.nilIfBlank {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Notes").font(.dc(12)).foregroundStyle(Theme.tertiary)
+                    Text(notes).foregroundStyle(Theme.ink)
+                }
+            }
+        }
+        .listRowBackground(Theme.card)
+    }
+
+    // MARK: Sections
+
+    private func summarySection(_ job: Job) -> some View {
+        Section {
+            VStack(alignment: .leading, spacing: 0) {
+                TypeLabel(type: job.type)
+                Text(job.title)
+                    .font(.dc(25, .bold))
+                    .tracking(-0.4)
+                    .foregroundStyle(Theme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 5)
+                HStack(spacing: 7) {
+                    StatusDot(status: job.status)
+                    Text("·").foregroundStyle(Theme.tertiary)
+                    Text(summaryDate(job))
+                        .font(.dc(14))
+                        .foregroundStyle(Theme.secondary)
+                    if job.isSelfArranged {
+                        Text("·").foregroundStyle(Theme.tertiary)
+                        Text("Self-arranged")
+                            .font(.dc(14))
+                            .foregroundStyle(Theme.tertiary)
+                    }
+                }
+                .padding(.top, 9)
+            }
+            .padding(.vertical, 4)
+        }
+        .listRowBackground(Theme.card)
+    }
+
+    /// The plain Time / Where / Weather group — no per-row SF Symbols.
+    @ViewBuilder
+    private func infoGroup(_ job: Job) -> some View {
+        let weather = job.weatherSummary?.nilIfBlank
+        if job.timeLabel != nil || job.destinationLabel != nil || weather != nil {
+            Section {
+                if let time = job.timeLabel {
+                    LabeledContent("Time") { Text(time).foregroundStyle(Theme.ink) }
+                }
+                if let dest = job.destinationLabel {
+                    LabeledContent("Where") {
+                        Text(dest).foregroundStyle(Theme.ink).multilineTextAlignment(.trailing)
+                    }
+                }
+                if let weather {
+                    LabeledContent("Weather") { Text(weather).foregroundStyle(Theme.ink) }
+                }
+            }
+            .listRowBackground(Theme.card)
+        }
+    }
+
+    @ViewBuilder
+    private func mapSection(_ job: Job) -> some View {
+        if job.destination?.nilIfBlank != nil || job.destinationPostcode?.nilIfBlank != nil {
+            Section {
+                DestinationMap(
+                    address: job.destination,
+                    postcode: job.destinationPostcode,
+                    title: job.title
+                )
+                .listRowInsets(EdgeInsets())
+            }
+            .listRowBackground(Theme.card)
+        }
+    }
+
+    private func editSection(_ job: Job) -> some View {
+        Section("Status") {
+            Picker("Status", selection: $status) {
+                ForEach(JobStatus.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+
+            if session.isAdmin {
+                Picker("Haulier", selection: $haulierId) {
+                    Text("Unassigned").tag(Int?.none)
+                    ForEach(session.hauliers) { h in
+                        HStack {
+                            Circle().fill(Color(hex: h.color, fallback: .gray)).frame(width: 10, height: 10)
+                            Text(h.name)
+                        }
+                        .tag(Int?.some(h.id))
+                    }
+                }
+            } else if job.hasHaulier {
+                LabeledContent("Haulier") {
+                    HaulierTag(name: job.haulierName, colorHex: session.haulier(id: job.haulierId)?.color)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Notes").font(.dc(12)).foregroundStyle(Theme.tertiary)
+                TextField("Add a note…", text: $notes, axis: .vertical)
+                    .lineLimit(2...6)
+            }
+
+            if let saveError {
+                Text(saveError).font(.footnote).foregroundStyle(.red)
+            }
+        }
+        .listRowBackground(Theme.card)
+    }
+
+    private func detailsSection(_ job: Job) -> some View {
+        Section("Details") {
+            if !job.furniture.isEmpty {
+                DisclosureRow(
+                    title: "Furniture",
+                    summary: "\(job.totalFurnitureCount) items",
+                    items: job.furniture
+                )
+            }
+            if !job.transport.isEmpty {
+                DisclosureRow(
+                    title: "Transport",
+                    summary: job.transportSummary ?? "",
+                    items: job.transport
+                )
+            }
+            if let mileage = job.mileage {
+                LabeledContent("Mileage", value: "\(mileage.formatted(.number.precision(.fractionLength(0...1)))) mi")
+            }
+            if session.isAdmin, let price = job.budgetPrice {
+                LabeledContent("Budget price", value: price.formatted(.currency(code: "GBP")))
+            }
+            if let deliver = job.deliverDate, let collect = job.collectDate {
+                let window = "\(DateUtil.weekdayDayLabel(from: deliver)) → \(DateUtil.weekdayDayLabel(from: collect))"
+                if session.isAdmin {
+                    Button { showDateEditor = true } label: {
+                        LabeledContent("Hire window") {
+                            HStack(spacing: 6) {
+                                Text(window)
+                                Image(systemName: "pencil")
+                            }
+                            .foregroundStyle(Theme.accent)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    LabeledContent("Hire window") {
+                        Text(window).foregroundStyle(Theme.secondary)
+                    }
+                }
+            }
+        }
+        .listRowBackground(Theme.card)
+    }
+
+    @ViewBuilder
+    private func contactSection(_ job: Job) -> some View {
+        if job.contactName?.nilIfBlank != nil || job.contactPhoneDigits != nil {
+            Section("Site contact") {
+                if let name = job.contactName?.nilIfBlank {
+                    LabeledContent("Name", value: name)
+                }
+                if let digits = job.contactPhoneDigits, let url = URL(string: "tel://\(digits)") {
+                    Link(destination: url) {
+                        LabeledContent(job.contactPhone ?? digits) {
+                            Text("Call").foregroundStyle(Theme.accent)
+                        }
+                    }
+                }
+            }
+            .listRowBackground(Theme.card)
+        }
+    }
+
+    @ViewBuilder
+    private var relatedSection: some View {
+        if let sibling = related.first {
+            Section("Linked job") {
+                NavigationLink(value: sibling.id) {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            TypeLabel(type: sibling.type)
+                            Text(DateUtil.relativeLabel(from: sibling.relevantDateString))
+                                .font(.dc(14))
+                                .foregroundStyle(Theme.secondary)
+                        }
+                        Spacer()
+                        StatusDot(status: sibling.status)
+                    }
+                }
+            }
+            .listRowBackground(Theme.card)
+        }
+    }
+
+    // MARK: Logic
+
+    private func summaryDate(_ job: Job) -> String {
+        let rel = DateUtil.relativeLabel(from: job.relevantDateString)
+        let weekday = DateUtil.weekdayDayLabel(from: job.relevantDateString)
+        return rel == weekday ? rel : "\(rel) · \(weekday)"
+    }
+
+    private var isDirty: Bool {
+        guard let job else { return false }
+        if status != job.status { return true }
+        if notes != (job.notes ?? "") { return true }
+        if session.isAdmin, haulierId != job.haulierId { return true }
+        return false
+    }
+
+    private func apply(_ job: Job) {
+        self.job = job
+        status = job.status
+        notes = job.notes ?? ""
+        haulierId = job.haulierId
+    }
+
+    private func reload(force: Bool = false) async {
+        // Instant render from cache, then refresh from the server.
+        if job == nil, let cached = store.jobs.first(where: { $0.id == jobId }) {
+            apply(cached)
+        }
+        // Seed loads from the list's cached assignments (covers archived/closed jobs,
+        // whose live movement endpoints 404 — the list already merged their history).
+        if assignments.isEmpty { assignments = store.assignments(for: jobId) }
+        if session.isDemo {
+            assignments = store.assignments(for: jobId)
+            furnitureOverrides = []
+            autoOpenSheetIfRequested()
+            return
+        }
+        guard let client = session.client else { return }
+
+        // All four reads are keyed only by jobId and independent of each other,
+        // so fire them concurrently rather than paying four serial round-trips.
+        async let jobResult = client.job(id: jobId)
+        async let relatedResult = client.relatedJob(id: jobId)
+        async let movementsResult = client.movements(jobId: jobId)
+        async let furnitureResult = client.movementFurniture(jobId: jobId)
+
+        do {
+            let fresh = try await jobResult
+            if force || !isDirty || job == nil { apply(fresh) } else { self.job = fresh }
+            loadError = nil
+        } catch {
+            if job == nil { loadError = (error as? APIError)?.errorDescription ?? error.localizedDescription }
+        }
+        related = (try? await relatedResult) ?? []
+        if let fresh = try? await movementsResult {
+            assignments = fresh
+            store.setAssignments(fresh, for: jobId)
+        }
+        if let furn = try? await furnitureResult {
+            furnitureOverrides = furn
+        }
+        autoOpenSheetIfRequested()
+    }
+
+    /// `-openSheet movement|dates` launch arg auto-presents a sheet (screenshots).
+    private func autoOpenSheetIfRequested() {
+        guard !didAutoOpen else { return }
+        didAutoOpen = true
+        switch UserDefaults.standard.string(forKey: "openSheet") {
+        case "movement": editingMovement = movements.first { $0.hasTransport }
+        case "dates": showDateEditor = true
+        default: break
+        }
+    }
+
+    private func loadMovements() async {
+        guard hasTransportLoads else { assignments = []; furnitureOverrides = []; return }
+        if session.isDemo { assignments = store.assignments(for: jobId); furnitureOverrides = []; return }
+        guard let client = session.client else { return }
+        if let fresh = try? await client.movements(jobId: jobId) {
+            assignments = fresh
+            // Keep the list cards' haulier roll-up in sync with this job's loads.
+            store.setAssignments(fresh, for: jobId)
+        }
+        if let furn = try? await client.movementFurniture(jobId: jobId) {
+            furnitureOverrides = furn
+        }
+    }
+
+    private func applyUpdated(_ updated: Job) {
+        apply(updated)
+        store.replace(updated)
+    }
+
+    /// Quick-send this load's details to its assigned driver on WhatsApp.
+    private func sendLoadWhatsApp(movement: Movement, phoneDigits: String) {
+        guard let job else { return }
+        let message = WhatsApp.message(
+            jobType: job.type,
+            eventName: job.eventName,
+            dateString: movement.effectiveDate,
+            transportName: movement.transportName,
+            loadPosition: movement.loadPosition,
+            totalMovements: movement.totalMovements,
+            contactName: job.contactName,
+            contactPhone: job.contactPhone,
+            destination: job.destination,
+            postcode: job.destinationPostcode,
+            items: allocation[movement.id] ?? [],
+            notes: movement.notes
+        )
+        if let url = WhatsApp.url(phoneDigits: phoneDigits, message: message) {
+            openURL(url)
+        }
+    }
+
+    private func save() async {
+        guard isDirty, let current = job else { return }
+
+        // Demo mode: apply the edit locally, no network.
+        if session.isDemo {
+            let updated = current.withLocalEdits(
+                status: status, notes: notes,
+                haulierId: haulierId, haulierName: session.haulier(id: haulierId)?.name
+            )
+            apply(updated)
+            store.replace(updated)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            withAnimation { savedTick = true }
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation { savedTick = false }
+            return
+        }
+
+        guard let client = session.client else { return }
+        isSaving = true
+        saveError = nil
+        do {
+            let updated = try await client.updateJob(
+                id: jobId,
+                status: status,
+                notes: notes,
+                haulier: session.isAdmin ? .set(haulierId) : .unchanged
+            )
+            apply(updated)
+            store.replace(updated)
+            await UINotificationFeedbackGenerator().notificationOccurred(.success)
+            withAnimation { savedTick = true }
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation { savedTick = false }
+        } catch {
+            saveError = (error as? APIError)?.errorDescription ?? error.localizedDescription
+            await UINotificationFeedbackGenerator().notificationOccurred(.error)
+        }
+        isSaving = false
+    }
+}
+
+/// One load row inside the job detail's Loads section.
+private struct MovementRow: View {
+    let movement: Movement
+    let haulier: Haulier?
+    let load: [LineItem]
+    var isInteractive: Bool = true
+
+    var body: some View {
+        HStack(spacing: 13) {
+            Text("\(movement.loadPosition)")
+                .font(.dc(17, .bold))
+                .monospacedDigit()
+                .foregroundStyle(Theme.tertiary)
+                .frame(width: 22, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(movement.transportLabel)
+                    .font(.dc(15, .semibold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(1)
+                loadContents
+                HStack(spacing: 12) {
+                    StatusDot(status: movement.status)
+                    HaulierTag(name: haulier?.name, colorHex: haulier?.color)
+                    if let override = movement.dateOverride {
+                        Text(DateUtil.weekdayDayLabel(from: override))
+                            .font(.dc(12.5, .medium))
+                            .foregroundStyle(Theme.accent)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+            if isInteractive {
+                Image(systemName: "chevron.right")
+                    .font(.dc(13, .semibold))
+                    .foregroundStyle(Theme.tertiary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var loadContents: some View {
+        if load.isEmpty {
+            Text("Empty load")
+                .font(.dc(12.5))
+                .foregroundStyle(Theme.tertiary)
+        } else {
+            Text(load.map { "\($0.quantity)× \($0.name)" }.joined(separator: ", "))
+                .font(.dc(12.5))
+                .foregroundStyle(Theme.tertiary)
+                .lineLimit(2)
+        }
+    }
+}
+
+/// Collapsible list of line items (furniture or transport). Plain rows, no icon.
+private struct DisclosureRow: View {
+    let title: String
+    let summary: String
+    let items: [LineItem]
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            ForEach(items) { item in
+                HStack {
+                    Text(item.name).font(.dc(14.5)).foregroundStyle(Theme.ink)
+                    Spacer()
+                    Text("× \(item.quantity)").font(.dc(14, .semibold)).foregroundStyle(Theme.tertiary)
+                }
+            }
+        } label: {
+            HStack {
+                Text(title).foregroundStyle(Theme.ink)
+                Spacer()
+                Text(summary).foregroundStyle(Theme.tertiary).font(.dc(14))
+            }
+        }
+    }
+}
