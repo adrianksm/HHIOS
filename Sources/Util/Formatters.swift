@@ -18,11 +18,22 @@ enum DateUtil {
         return f
     }()
 
+    /// Content-keyed cache: sort comparators and grouping call this thousands of
+    /// times per pass over a handful of distinct day strings, and DateFormatter
+    /// parsing is expensive. NSNull marks "parsed to nil" so misses are cached
+    /// too. NSCache is thread-safe.
+    private static let parseCache = NSCache<NSString, AnyObject>()
+
     static func date(from apiString: String?) -> Date? {
         guard let s = apiString, !s.isEmpty else { return nil }
         // Some date fields may include a time component; keep just the date part.
         let dayPart = String(s.prefix(10))
-        return apiParser.date(from: dayPart)
+        if let cached = parseCache.object(forKey: dayPart as NSString) {
+            return cached as? Date
+        }
+        let parsed = apiParser.date(from: dayPart)
+        parseCache.setObject((parsed as NSDate?) ?? NSNull(), forKey: dayPart as NSString)
+        return parsed
     }
 
     static func todayString() -> String {

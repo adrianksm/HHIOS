@@ -260,6 +260,9 @@ final class JobStore {
     /// Update the cached assignments for a job (after editing in the detail view),
     /// so the list cards reflect the change without a full reload.
     func setAssignments(_ assignments: [MovementAssignment], for jobId: Int) {
+        // Post-save refreshes usually hand back exactly what the optimistic
+        // update already applied — skip the full movement rebuild when so.
+        guard assignmentsByJob[jobId] != assignments else { return }
         assignmentsByJob[jobId] = assignments
         rebuildMovements()
     }
@@ -267,6 +270,9 @@ final class JobStore {
     /// Replace a single job in place after an edit, keeping sort order.
     func replace(_ job: Job) {
         if let idx = jobs.firstIndex(where: { $0.id == job.id }) {
+            // The PATCH response often equals the optimistic edit already in
+            // place — skip the re-sort and full movement rebuild when so.
+            guard jobs[idx] != job else { return }
             jobs[idx] = job
         } else {
             jobs.append(job)
