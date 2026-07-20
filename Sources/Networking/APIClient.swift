@@ -76,10 +76,18 @@ struct APIClient {
         try await request("/api/jobs/\(jobId)/movement-furniture")
     }
 
+    /// A status/notes PATCH response: the updated job, plus the server's
+    /// "every movement of this job is now completed" flag that drives the
+    /// Current-RMS completion flow (`CrmsCompletionFlow`).
+    struct JobUpdateResult {
+        let job: Job
+        let allMovementsCompleted: Bool
+    }
+
     /// Update job-level fields. Pass only the keys you want to change.
     /// `haulierId` uses `.set(nil)` to unassign vs `.unchanged` to leave alone.
     func updateJob(id: Int, status: JobStatus? = nil, notes: String? = nil,
-                   haulier: HaulierChange = .unchanged) async throws -> Job {
+                   haulier: HaulierChange = .unchanged) async throws -> JobUpdateResult {
         var body: [String: Any] = [:]
         if let status { body["status"] = status.rawValue }
         if let notes { body["notes"] = notes }
@@ -87,7 +95,8 @@ struct APIClient {
         case .unchanged: break
         case .set(let value): body["haulier_id"] = value ?? NSNull()
         }
-        return try await request("/api/jobs/\(id)", method: "PATCH", body: body)
+        let data = try await requestData("/api/jobs/\(id)", method: "PATCH", body: body)
+        return try Self.decodeJobUpdate(data)
     }
 
     enum HaulierChange {
@@ -107,7 +116,7 @@ struct APIClient {
         status: JobStatus, notes: String,
         haulier: HaulierChange = .unchanged, date: DateChange = .unchanged,
         isAdmin: Bool
-    ) async throws -> Job {
+    ) async throws -> JobUpdateResult {
         var movement: [String: Any] = [
             "transport_name": transportName,
             "movement_index": movementIndex,
@@ -118,7 +127,61 @@ struct APIClient {
             if case .set(let value) = date { movement["date"] = value ?? NSNull() }
         }
         let body: [String: Any] = ["status": status.rawValue, "movement": movement]
-        return try await request("/api/jobs/\(jobId)", method: "PATCH", body: body)
+        let data = try await requestData("/api/jobs/\(jobId)", method: "PATCH", body: body)
+        return try Self.decodeJobUpdate(data)
+    }
+
+    /// The PATCH response is the job object with `allMovementsCompleted` merged
+    /// in at the top level (see the web repo's `src/routes/api/jobs.js`) — the
+    /// `Job` decoder skips unknown keys, so pull the flag out separately.
+    /// Missing flag decodes as `false`, which can never over-trigger the flow.
+    private static func decodeJobUpdate(_ data: Data) throws -> JobUpdateResult {
+        struct Flag: Decodable { let allMovementsCompleted: Bool? }
+        do {
+            let job = try JSONDecoder().decode(Job.self, from: data)
+            let flag = (try? JSONDecoder().decode(Flag.self, from: data))?.allMovementsCompleted ?? false
+            return JobUpdateResult(job: job, allMovementsCompleted: flag)
+        } catch {
+            throw APIError.decoding(String(describing: error))
+        }
+    }
+
+    // MARK: - Current-RMS completion flow
+
+    /// The opportunity's line items (`opportunity.opportunity_items`).
+    func opportunityItems(opportunityId: Int) async throws -> CrmsOpportunityItemsResponse {
+        try await request("/api/crms/opportunities/\(opportunityId)/items")
+    }
+
+    /// One item's `item_assets` — the ids book-out/check-in/close-order need.
+    func opportunityItemAssets(opportunityId: Int, itemId: Int) async throws -> CrmsItemAssetsResponse {
+        try await request("/api/crms/opportunities/\(opportunityId)/items/\(itemId)/assets")
+    }
+
+    /// Book out items in Current RMS (delivery completed).
+    func bookOut(opportunityId: Int, itemAssetIds: [Int]) async throws {
+        _ = try await requestData(
+            "/api/crms/opportunities/\(opportunityId)/book-out",
+            method: "POST", body: ["item_asset_ids": itemAssetIds]
+        )
+    }
+
+    /// Check in items in Current RMS (collection completed).
+    func checkIn(opportunityId: Int, itemAssetIds: [Int]) async throws {
+        _ = try await requestData(
+            "/api/crms/opportunities/\(opportunityId)/check-in",
+            method: "POST", body: ["item_asset_ids": itemAssetIds]
+        )
+    }
+
+    /// Close the order in Current RMS: finalise items + services, mark the
+    /// opportunity Completed. Always answers 200 with per-step results.
+    func closeOrder(opportunityId: Int, itemAssetIds: [Int], serviceAssetIds: [Int]) async throws -> CrmsCloseOrderResponse {
+        try await request(
+            "/api/crms/opportunities/\(opportunityId)/close-order",
+            method: "POST",
+            body: ["item_asset_ids": itemAssetIds, "service_asset_ids": serviceAssetIds]
+        )
     }
 
     /// Update the opportunity's delivery & collection dates (admin). Pushes to

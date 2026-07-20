@@ -36,6 +36,10 @@ struct JobDetailView: View {
     /// any sheet/form that could otherwise show an inline error.
     @State private var backgroundSaveError: String?
 
+    /// Current-RMS completion: prompts book-out/check-in (and close-order)
+    /// when a status PATCH completes a CRMS job's final movement.
+    @State private var crmsFlow = CrmsCompletionFlow()
+
     // Sheets
     @State private var editingMovement: Movement?
     @State private var showDateEditor = false
@@ -109,7 +113,62 @@ struct JobDetailView: View {
         } message: {
             Text(backgroundSaveError ?? "")
         }
+        // Current-RMS completion prompts. Setters are no-ops: every dismissal
+        // goes through a button, and each button's flow transition flips the
+        // getter to false — so a dismissal can never clobber a transition.
+        .alert(crmsFlow.confirmActionTitle, isPresented: Binding(
+            get: { crmsFlow.step == .confirmAction }, set: { _ in }
+        )) {
+            Button("Cancel", role: .cancel) { crmsFlow.cancel() }
+            Button("Confirm") { crmsFlow.confirmAction() }
+        } message: {
+            Text(crmsFlow.confirmActionMessage)
+        }
+        .alert(CrmsCompletionFlow.confirmCloseTitle, isPresented: Binding(
+            get: { crmsFlow.step == .confirmClose }, set: { _ in }
+        )) {
+            Button("Not Now", role: .cancel) { crmsFlow.declineClose() }
+            Button("Close Order") { crmsFlow.confirmClose() }
+        } message: {
+            Text(CrmsCompletionFlow.confirmCloseMessage)
+        }
+        .alert(crmsResultTitle, isPresented: Binding(
+            get: { crmsResultMessage != nil }, set: { _ in }
+        )) {
+            Button("OK") { crmsFlow.reset() }
+        } message: {
+            Text(crmsResultMessage ?? "")
+        }
+        .overlay { crmsWorkingOverlay }
         .task { await reload() }
+    }
+
+    private var crmsResultTitle: String {
+        if case .result(let title, _) = crmsFlow.step { return title }
+        return ""
+    }
+
+    private var crmsResultMessage: String? {
+        if case .result(_, let message) = crmsFlow.step { return message }
+        return nil
+    }
+
+    /// Small HUD while the flow collects assets / calls Current RMS, so the
+    /// gap between the confirm prompt and its outcome is visibly busy.
+    @ViewBuilder
+    private var crmsWorkingOverlay: some View {
+        if case .working(let message) = crmsFlow.step {
+            VStack(spacing: 12) {
+                ProgressView()
+                Text(message)
+                    .font(.dc(14))
+                    .foregroundStyle(Theme.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(24)
+            .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
+            .shadow(color: .black.opacity(0.15), radius: 20)
+        }
     }
 
     // MARK: Loads (per-movement)
@@ -643,10 +702,14 @@ struct JobDetailView: View {
 
         Task {
             do {
-                let updated = try await client.updateJob(
+                let result = try await client.updateJob(
                     id: jobId, status: newStatus, notes: newNotes, haulier: haulierChange
                 )
-                applyUpdated(updated)
+                applyUpdated(result.job)
+                crmsFlow.begin(
+                    job: result.job, oldStatus: previousJob.status, newStatus: newStatus,
+                    allMovementsCompleted: result.allMovementsCompleted, client: client
+                )
             } catch {
                 apply(previousJob)
                 store.replace(previousJob)
@@ -692,6 +755,9 @@ struct JobDetailView: View {
         let previousJob = job
         let previousAssignments = assignments
         let previousStoreAssignments = store.assignments(for: jobId)
+        // This movement's status before the edit — the CRMS flow triggers only
+        // on a genuine transition into `completed`.
+        let previousStatus = movement.status
 
         // Optimistic upsert: update the matching row, or synthesize a placeholder
         // (server-owned fields get sensible nil/derived values — the follow-up
@@ -727,14 +793,18 @@ struct JobDetailView: View {
 
         Task {
             do {
-                let updatedJob = try await client.updateMovement(
+                let result = try await client.updateMovement(
                     jobId: jobId, transportName: transportName, movementIndex: movement.movementIndex,
                     status: edit.status, notes: edit.notes,
                     haulier: edit.haulier, date: edit.date,
                     isAdmin: session.isAdmin
                 )
-                applyUpdated(updatedJob)
+                applyUpdated(result.job)
                 await loadMovements(includeFurniture: false)
+                crmsFlow.begin(
+                    job: result.job, oldStatus: previousStatus, newStatus: edit.status,
+                    allMovementsCompleted: result.allMovementsCompleted, client: client
+                )
             } catch {
                 assignments = previousAssignments
                 store.setAssignments(previousStoreAssignments, for: jobId)
