@@ -16,12 +16,12 @@ cd "$REPO"
 
 BUNDLE_ID="com.spudbox.hirehaulage"
 TEAM="N8W459SD9Z"                                    # Developer Program team (ade@coleplanet.com signed into Xcode)
-HW_UDID="00008110-000808692EBA801E"                 # iPhone hardware id (xcodebuild destination)
-DEVICECTL_ID="6ABE3F00-6FAC-5FA0-BA8A-B9EDF02783A8" # iPhone CoreDevice id (devicectl)
+HW_UDID="00008160-001068993C00000A"                 # iPhone 18 Pro hardware id (xcodebuild destination)
+DEVICECTL_ID="062B3099-A81F-58D5-A090-4A2AF09D9591" # iPhone 18 Pro CoreDevice id (devicectl)
 DERIVED="$REPO/build/device-dd"
 
 echo "📱 Checking the iPhone is connected…"
-if ! xcrun devicectl list devices 2>/dev/null | grep -q "$DEVICECTL_ID"; then
+if ! xcrun devicectl list devices 2>/dev/null | grep "$HW_UDID" >/dev/null; then
   echo "❌ iPhone not found. Plug it in with a cable, unlock it, tap 'Trust' if asked, then re-run."
   exit 1
 fi

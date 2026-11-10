@@ -2,7 +2,7 @@
 
 A native **SwiftUI** iPhone app for the Hire Haulage delivery & collection
 planner. It talks to your existing Node/Express server
-(`https://hirehaulage.spudbox.com`) over its REST API — **no backend changes
+(`https://orders.picnictablehire.com`) over its REST API — **no backend changes
 required**. Authentication reuses the server's existing cookie session
 (`POST /api/auth/login`); `URLSession` carries the cookie automatically.
 
@@ -57,7 +57,7 @@ xcodebuild -project HHiOS.xcodeproj -scheme HHiOS \
 
 ## Connecting to the server
 
-- Default server URL: `https://hirehaulage.spudbox.com`.
+- Default server URL: `https://orders.picnictablehire.com`.
 - Change it under **More → Connection → Server** (or on the login screen via
   **Server settings**). Changing it signs you out.
 - To test against a **local** server (`http://localhost:3000` in the simulator,
@@ -97,7 +97,7 @@ xcodebuild -project HHiOS.xcodeproj -scheme HHiOS \
 - **Mileage / budget-price calculation** trigger (`/api/jobs/:id/calculate-distance`).
 - **Push notifications** / offline cache (would need small backend additions).
 
-> **Live login confirmed** against production (`hirehaulage.spudbox.com`) on
+> **Live login confirmed** against production (`orders.picnictablehire.com`) on
 > 2026-06-30 — sign-in, session cookie, and live data load all work on device.
 
 ---

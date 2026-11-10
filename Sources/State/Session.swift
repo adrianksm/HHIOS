@@ -12,7 +12,7 @@ final class Session {
         case signedIn
     }
 
-    static let defaultBaseURL = "https://hirehaulage.spudbox.com"
+    static let defaultBaseURL = "https://orders.picnictablehire.com"
     private static let baseURLKey = "HH_baseURL"
     private static let sessionCacheKey = "HH_sessionCache"
 
